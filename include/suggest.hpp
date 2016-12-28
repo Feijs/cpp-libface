@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <assert.h>
 
+#include <include/phrase_map.hpp>
 #include <include/utils.hpp>
 #include <include/types.hpp>
 

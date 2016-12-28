@@ -19,10 +19,10 @@
 #include <include/segtree.hpp>
 #include <include/sparsetable.hpp>
 #include <include/benderrmq.hpp>
-#include <include/phrase_map.hpp>
 #include <include/suggest.hpp>
 #include <include/types.hpp>
 #include <include/utils.hpp>
+#include <include/data_container.hpp>
 
 // C++-headers
 #include <string>
@@ -48,9 +48,6 @@
 
 
 
-char *if_mmap_addr = NULL;      // Pointer to the mmapped area of the file
-off_t if_length = 0;            // The length of the input file
-volatile bool building = false; // TRUE if the structure is being built
 unsigned long nreq = 0;         // The total number of requests served till now
 int line_limit = -1;            // The number of lines to import from the input file
 time_t started_at;              // When was the server started
@@ -58,56 +55,32 @@ bool opt_show_help = false;     // Was --help requested?
 const char *ac_file = NULL;     // Path to the input file
 int port = 6767;                // The port number on which to start the HTTP server
 const char *project_homepage_url = "https://github.com/duckduckgo/cpp-libface/";
-
-std::map<std::string, PhraseMap*> pm_map;  // Map of key -> PhraseMap
-std::map<std::string, RMQ*> st_map;        // Map of key -> RMQ data structure
+std::map<std::string, DataContainer*> data_map;
 
 enum {
     // We are in a non-WS state
     ILP_BEFORE_NON_WS  = 0,
-
-    // We are parsing the tenant (integer)
-    ILP_TENANT         = 1,
-
-    // We are in the state after the tenant but before the TAB
-    // character separating the tenant & the weight
-    ILP_BEFORE_WTAB    = 2,
-
-    // We are in the state after the TAB character and potentially
-    // before the weight starts (or at the weight)
-    ILP_AFTER_WTAB     = 3,
-
+    
     // We are parsing the weight (integer)
-    ILP_WEIGHT         = 4,
-
-    // We are in the state after the weight but before the TAB
-    // character separating the weight & the locale
-    ILP_BEFORE_LTAB    = 5,
-
-    // We are in the state after the TAB character and potentially
-    // before the locale starts (or at the locale)
-    ILP_AFTER_LTAB     = 6,
-
-    // The state parsing the locale
-    ILP_LOCALE         = 7,
+    ILP_WEIGHT         = 1,
 
     // We are in the state after the locale but before the TAB
     // character separating the locale & the phrase
-    ILP_BEFORE_PTAB    = 8,
+    ILP_BEFORE_PTAB    = 2,
 
     // We are in the state after the TAB character and potentially
     // before the phrase starts (or at the phrase)
-    ILP_AFTER_PTAB     = 9,
+    ILP_AFTER_PTAB     = 3,
 
     // The state parsing the phrase
-    ILP_PHRASE         = 10,
+    ILP_PHRASE         = 4,
 
     // The state after the TAB character following the phrase
     // (currently unused)
-    ILP_AFTER_STAB     = 11,
+    ILP_AFTER_STAB     = 5,
 
     // The state in which we are parsing the snippet
-    ILP_SNIPPET        = 12
+    ILP_SNIPPET        = 6
 };
 
 enum { IMPORT_FILE_NOT_FOUND = 1,
@@ -118,35 +91,30 @@ enum { IMPORT_FILE_NOT_FOUND = 1,
 
 struct InputLineParser {
     int state;            // Current parsing state
-    const char *mem_base; // Base address of the mmapped file
+    const DataContainer *mem_data; //
+    //const char *mem_base; // Base address of the mmapped file
     const char *buff;     // A pointer to the current line to be parsed
     size_t buff_offset;   // Offset of 'buff' [above] relative to the beginning of the file. Used to index into mem_base
-    int *pt;              // A pointer to the tentant field
     int *pn;              // A pointer to any integral field being parsed
-    std::string *plocale; // A pointer to the locale field
     std::string *pphrase; // A pointer to a string field being parsed
 
     // The input file is mmap()ped in the process' address space.
 
     StringProxy *psnippet_proxy; // The psnippet_proxy is a pointer to a Proxy String object that points to memory in the mmapped region
 
-    InputLineParser(const char *_mem_base, size_t _bo, 
-                    const char *_buff, int *_pt,
-                    std::string *_plocale, int *_pn,
+    InputLineParser(const DataContainer *_mem_data, size_t _bo, 
+                    const char *_buff, int *_pn,
                     std::string *_pphrase, StringProxy *_psp)
-        : state(ILP_BEFORE_NON_WS), mem_base(_mem_base), buff(_buff), 
-          buff_offset(_bo), pt(_pt), plocale(_plocale), pn(_pn),
-          pphrase(_pphrase), psnippet_proxy(_psp)
+        : state(ILP_BEFORE_NON_WS), mem_data(_mem_data), buff(_buff), 
+          buff_offset(_bo), pn(_pn), pphrase(_pphrase), psnippet_proxy(_psp)
     { }
 
     void
     start_parsing() {
         int i = 0;                  // The current record byte-offset.
         int n = 0;                  // Temporary buffer for numeric (integer) fields.
-        const char *l_start = NULL; // Beginning of the locale.
         const char *p_start = NULL; // Beginning of the phrase.
         const char *s_start = NULL; // Beginning of the snippet.
-        int l_len = 0;              // Locale Length.
         int p_len = 0;              // Phrase Length.
         int s_len = 0;              // Snippet length.
 
@@ -157,41 +125,11 @@ struct InputLineParser {
             switch (this->state) {
             case ILP_BEFORE_NON_WS:
                 if (!isspace(ch)) {
-                    this->state = ILP_TENANT;
-                }
-                else {
-                    ++i;
-                }
-                break;
-
-            case ILP_TENANT:
-                if (isdigit(ch)) {
-                    n *= 10;
-                    n += (ch - '0');
-                    ++i;
-                }
-                else {
-                    on_tenant(n);
-                    this->state = ILP_BEFORE_WTAB;
-                    n = 0;
-                }
-                break;
-
-            case ILP_BEFORE_WTAB:
-                if (ch == '\t') {
-                    this->state = ILP_AFTER_WTAB;
-                }
-                ++i;
-                break;
-
-            case ILP_AFTER_WTAB:
-                if (isspace(ch)) {
-                    ++i;
-                }
-                else {
                     this->state = ILP_WEIGHT;
                 }
-
+                else {
+                    ++i;
+                }
                 break;
 
             case ILP_WEIGHT:
@@ -201,40 +139,9 @@ struct InputLineParser {
                     ++i;
                 }
                 else {
-                    this->state = ILP_BEFORE_LTAB;
+                    this->state = ILP_BEFORE_PTAB;
                     on_weight(n);
                 }
-                break;
-
-            case ILP_BEFORE_LTAB:
-                if (ch == '\t') {
-                    this->state = ILP_AFTER_LTAB;
-                }
-                ++i;
-                break;
-
-            case ILP_AFTER_LTAB:
-                if (isspace(ch)) {
-                    ++i;
-                }
-                else {
-                    l_start = this->buff + i;
-                    this->state = ILP_LOCALE;
-                }
-                break;
-
-            case ILP_LOCALE:
-                if (ch == '\t') {
-                    this->state = ILP_AFTER_PTAB;
-                }
-                else if (isspace(ch)) {
-                    // Locale should not contain spaces
-                    this->state = ILP_BEFORE_PTAB;
-                }
-                else {
-                    ++l_len;
-                }
-                ++i;
                 break;
 
             case ILP_BEFORE_PTAB:
@@ -279,21 +186,8 @@ struct InputLineParser {
         }
 
         DCERR("\n");
-        on_locale(l_start, l_len);
         on_phrase(p_start, p_len);
         on_snippet(s_start, s_len);
-    }
-
-    void
-    on_tenant(int n) {
-        *(this->pt) = n;
-    }
-
-    void
-    on_locale(const char *data, int len) {
-        if (len && this->plocale) {
-            this->plocale->assign(data, len);
-        }
     }
 
     void
@@ -312,13 +206,13 @@ struct InputLineParser {
     void
     on_snippet(const char *data, int len) {
         if (len && this->psnippet_proxy) {
-            const char *base = this->mem_base + this->buff_offset + 
+            const char *base = this->mem_data->if_mmap_addr + this->buff_offset + 
                 (data - this->buff);
-            if (base < if_mmap_addr || base + len > if_mmap_addr + if_length) {
-                fprintf(stderr, "base: %p, if_mmap_addr: %p, if_mmap_addr+if_length: %p\n", base, if_mmap_addr, if_mmap_addr + if_length);
-                assert(base >= if_mmap_addr);
-                assert(base <= if_mmap_addr + if_length);
-                assert(base + len <= if_mmap_addr + if_length);
+            if (base < this->mem_data->if_mmap_addr || base + len > this->mem_data->if_mmap_addr + this->mem_data->if_length) {
+                fprintf(stderr, "base: %p, if_mmap_addr: %p, if_mmap_addr+if_length: %p\n", base, this->mem_data->if_mmap_addr, this->mem_data->if_mmap_addr + this->mem_data->if_length);
+                assert(base >= this->mem_data->if_mmap_addr);
+                assert(base <= this->mem_data->if_mmap_addr + this->mem_data->if_length);
+                assert(base + len <= this->mem_data->if_mmap_addr + this->mem_data->if_length);
             }
             DCERR("on_snippet::base: "<<(void*)base<<", len: "<<len<<"\n");
             this->psnippet_proxy->assign(base, len);
@@ -578,16 +472,8 @@ void get_line(std::ifstream fin, char *buff, int buff_len, int &read_len) {
     buff[INPUT_LINE_SIZE - 1] = '\0';
 }
 
-std::string get_key(std::string tenant, std::string locale) {
-    std:string key = tenant;
-    key += ':';
-    key.append(locale);
-
-    return key;
-}
-
 int
-do_import(std::string file, uint_t limit, 
+do_import(std::string file, const std::string key, uint_t limit, 
           int &rnadded, int &rnlines) {
     bool is_input_sorted = true;
 #if defined USE_CXX_IO
@@ -605,42 +491,48 @@ do_import(std::string file, uint_t limit,
         return -IMPORT_FILE_NOT_FOUND;
     }
     else {
-        building = true;
         int nlines = 0;
         int foffset = 0;
+        DataContainer* data_container;
 
-        if (if_mmap_addr) {
-            int r = munmap(if_mmap_addr, if_length);
+        try {
+            data_container = data_map.at(key);
+            data_container->building = true;
+
+            int r = munmap(data_container->if_mmap_addr, data_container->if_length);
+            
             if (r < 0) {
                 perror("munmap");
-                building = false;
+                data_container->building = false;
                 return -IMPORT_MUNMAP_FAILED;
             }
+        } catch (const std::out_of_range& oor) {
+            data_container = new DataContainer;
+            data_container->building = true;
+            data_map[key] = data_container;
         }
 
         // Potential race condition + not checking for return value
-        if_length = file_size(file.c_str());
+        data_container->if_length = file_size(file.c_str());
 
         // mmap() the input file in
-        if_mmap_addr = (char*)mmap(NULL, if_length, PROT_READ, MAP_SHARED, fd, 0);
-        if (if_mmap_addr == MAP_FAILED) {
-            fprintf(stderr, "length: %llu, fd: %d\n", if_length, fd);
+        data_container->if_mmap_addr = (char*) mmap(
+            NULL, size_t(data_container->if_length), PROT_READ, MAP_SHARED, fd, 0
+        );
+    
+        if (data_container->if_mmap_addr == MAP_FAILED) {
+            fprintf(stderr, "length: %llu, fd: %d\n", data_container->if_length, fd);
             perror("mmap");
             if (fin) { fclose(fin); }
             if (fd != -1) { close(fd); }
-            building = false;
+            data_container->building = false;
             return -IMPORT_MMAP_FAILED;
         }
 
-        
-        for (std::map<std::string, PhraseMap*>::iterator it = pm_map.begin(); it != pm_map.end(); ++it) {
-            it->second->repr.clear();
-        }
+        data_container->pm.repr.clear();
 
         char buff[INPUT_LINE_SIZE];
         std::string prev_phrase;
-        PhraseMap* current_map;
-        RMQ* current_rmq;
 
         while (!is_EOF(fin) && limit--) {
             buff[0] = '\0';
@@ -654,31 +546,16 @@ do_import(std::string file, uint_t limit,
             ++nlines;
 
             int weight = 0;
-            int tenant = 0;
-            std::string locale;
             std::string phrase;
             StringProxy snippet;
-            InputLineParser(if_mmap_addr, foffset, buff, &tenant, &locale, &weight, &phrase, &snippet).start_parsing();
 
+            InputLineParser(data_container, foffset, buff, &weight, &phrase, &snippet).start_parsing();
             foffset += llen;
-
-            if (locale.empty()) {
-                continue;
-            }
-
-            std:string key = get_key(std::to_string(tenant), locale);
-
-            try {
-                current_map = pm_map.at(key);
-            } catch (const std::out_of_range& oor) {
-                current_map = new PhraseMap();
-                pm_map[key] = current_map;
-            }
 
             if (!phrase.empty()) {
                 str_lowercase(phrase);
                 DCERR("Adding: " << weight << ", " << phrase << ", " << std::string(snippet) << endl);
-                current_map->insert(weight, phrase, snippet);
+                data_container->pm.insert(weight, phrase, snippet);
             }
             if (is_input_sorted && prev_phrase <= phrase) {
                 prev_phrase.swap(phrase);
@@ -690,31 +567,18 @@ do_import(std::string file, uint_t limit,
         DCERR("Creating PhraseMap::Input is " << (!is_input_sorted ? "NOT " : "") << "sorted\n");
         fclose(fin);
 
-        rnadded = 0;
+        data_container->pm.finalize();
 
-        for (std::map<std::string, PhraseMap*>::iterator it = pm_map.begin(); it != pm_map.end(); ++it) {
-            PhraseMap* pm = it->second;
-            pm->finalize();
-
-            vui_t weights;
-            for (size_t i = 0; i < pm->repr.size(); ++i) {
-                weights.push_back(pm->repr[i].weight);
-            }
-
-            try {
-                current_rmq = st_map.at(it->first);
-            } catch (const std::out_of_range& oor) {
-                current_rmq = new RMQ();
-                st_map[it->first] = current_rmq;
-            }
-
-            current_rmq->initialize(weights);
-
-            rnadded += (int) weights.size();
+        vui_t weights;
+        for (size_t i = 0; i < data_container->pm.repr.size(); ++i) {
+            weights.push_back(data_container->pm.repr[i].weight);
         }
 
+        data_container->st.initialize(weights);
+
+        rnadded = weights.size();
         rnlines = nlines;
-        building = false;
+        data_container->building = false;
     }
 
     return 0;
@@ -726,6 +590,8 @@ static void handle_import(client_t *client, parsed_url_t &url) {
     headers["Cache-Control"] = "no-cache";
 
     std::string file = unescape_query(url.query["file"]);
+    std::string key = unescape_query(url.query["key"]);
+
     uint_t limit     = atoi(url.query["limit"].c_str());
     int nadded, nlines;
     const time_t start_time = time(NULL);
@@ -734,7 +600,7 @@ static void handle_import(client_t *client, parsed_url_t &url) {
         limit = minus_one;
     }
 
-    int ret = do_import(file, limit, nadded, nlines);
+    int ret = do_import(file, key, limit, nadded, nlines);
     if (ret < 0) {
         switch (-ret) {
         case IMPORT_FILE_NOT_FOUND:
@@ -774,33 +640,36 @@ static void handle_export(client_t *client, parsed_url_t &url) {
     headers["Cache-Control"] = "no-cache";
 
     std::string file = url.query["file"];
-    if (building) {
+    std::string key = unescape_query(url.query["key"]);
+    DataContainer* data_container;
+
+    try {
+        data_container = data_map.at(key);
+    } catch (const std::out_of_range& oor) {
+        body = "Key not found";
+        write_response(client, 404, "Not found", headers, body);
+    }
+
+    if (data_container->building) {
         body = "Busy\n";
         write_response(client, 412, "Busy", headers, body);
         return;
     }
 
     // Prevent modifications to 'pm' while we export
-    building = true;
+    data_container->building = true;
     ofstream fout(file.c_str());
     const time_t start_time = time(NULL);
-    int nwritten = 0;
 
-    for (std::map<std::string, PhraseMap*>::iterator it = pm_map.begin(); it != pm_map.end(); ++it) {
-        PhraseMap* pm = it->second;
-
-        for (size_t i = 0; i < pm->repr.size(); ++i) {
-            fout<<pm->repr[i].weight<<'\t'<<pm->repr[i].phrase<<'\t'<<std::string(pm->repr[i].snippet)<<'\n';
-        }
-
-        nwritten += (int) pm->repr.size();
+    for (size_t i = 0; i < data_container->pm.repr.size(); ++i) {
+        fout<<data_container->pm.repr[i].weight<<'\t'<<data_container->pm.repr[i].phrase<<'\t'<<std::string(data_container->pm.repr[i].snippet)<<'\n';
     }
 
-    building = false;
+    data_container->building = false;
     std::ostringstream os;
-    os << "Successfully wrote " << nwritten
-       << " records to output file '" << file
-       << "' in " << (time(NULL) - start_time) << "second(s)\n";
+    os << "Successfully wrote " << data_container->pm.repr.size()
+    << " records to output file '" << file
+    << "' in " << (time(NULL) - start_time) << "second(s)\n";
     body = os.str();
     write_response(client, 200, "OK", headers, body);
 }
@@ -811,7 +680,19 @@ static void handle_suggest(client_t *client, parsed_url_t &url) {
     headers_t headers;
     headers["Cache-Control"] = "no-cache";
 
-    if (building) {
+    DataContainer* data_container;
+    std::string key = unescape_query(url.query["k"]);
+
+    try {
+        data_container = data_map.at(key);
+    } catch (const std::out_of_range& oor) {
+        body = "Key not found";
+        write_response(client, 404, "Not found", headers, body);
+        return;
+    }
+
+
+    if (data_container->building) {
         write_response(client, 412, "Busy", headers, body);
         return;
     }
@@ -820,10 +701,8 @@ static void handle_suggest(client_t *client, parsed_url_t &url) {
     std::string sn     = url.query["n"];
     std::string cb     = unescape_query(url.query["callback"]);
     std::string type   = unescape_query(url.query["type"]);
-    std::string locale = unescape_query(url.query["l"]);
-    std::string tenant = unescape_query(url.query["t"]);
 
-    DCERR("handle_suggest::q:"<<q<<", sn:"<<sn<<", tenant:"<<tenant<<", locale:"<<locale<<", callback: "<<cb<<endl);
+    DCERR("handle_suggest::q:"<<q<<", sn:"<<sn<<", key:"<<key<<", callback: "<<cb<<endl);
 
     unsigned int n = sn.empty() ? NMAX : atoi(sn.c_str());
     if (n > NMAX) {
@@ -835,15 +714,7 @@ static void handle_suggest(client_t *client, parsed_url_t &url) {
 
     const bool has_cb = !cb.empty();
     str_lowercase(q);
-    vp_t results = vp_t();
-
-    std:string key = get_key(tenant, locale);
-
-    try {
-        PhraseMap* map = new PhraseMap(pm_map.at(key));
-        RMQ* rmq = new RMQ(st_map.at(key));
-        results = suggest(*map, *rmq, q, n);
-    } catch (const std::out_of_range& oor) {}
+    vp_t results = suggest(data_container->pm, data_container->st, q, n);
 
     /*
       for (size_t i = 0; i < results.size(); ++i) {
@@ -871,19 +742,22 @@ static void handle_stats(client_t *client, parsed_url_t &url) {
     b += sprintf(b, "Answered %lu queries\n", nreq);
     b += sprintf(b, "Uptime: %s\n", get_uptime().c_str());
 
-    if (building) {
-        b += sprintf(b, "Data Store is busy\n");
-    }
-    else {
-        int size = 0;
+    int size = 0;
+    int building = 0;
 
-        for (std::map<std::string, PhraseMap*>::iterator it = pm_map.begin(); it != pm_map.end(); ++it) {
-            size += (int) it->second->repr.size();
+    for (std::map<std::string, DataContainer*>::iterator it = data_map.begin(); it != data_map.end(); ++it) {
+        if (it->second->building) {
+            building++;
+            continue;
         }
 
-        b += sprintf(b, "Data store size: %d entries\n", size);
+        size += (int) it->second->pm.repr.size();
     }
+
+    b += sprintf(b, "Data store size: %d keys, %d total entries\n", data_map.size(), size);
     b += sprintf(b, "Memory usage: %d MiB\n", get_memory_usage(getpid())/1024);
+    b += sprintf(b, "Building: %d containers\n", building);
+
     body = buff;
     write_response(client, 200, "OK", headers, body);
 }
@@ -1000,7 +874,7 @@ main(int argc, char* argv[]) {
     if (ac_file) {
         int nadded, nlines;
         const time_t start_time = time(NULL);
-        int ret = do_import(ac_file, line_limit, nadded, nlines);
+        int ret = do_import(ac_file, std::string(""), line_limit, nadded, nlines);
         if (ret < 0) {
             switch (-ret) {
             case IMPORT_FILE_NOT_FOUND:
