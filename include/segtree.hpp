@@ -26,6 +26,11 @@ public:
         this->initialize(_len);
     }
 
+    SegmentTree(const SegmentTree* orig) {
+        this->repr = orig->repr;
+        this->len = orig->len;
+    }
+
     void
     initialize(uint_t _len) {
         len = _len;

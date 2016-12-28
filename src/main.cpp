@@ -48,8 +48,6 @@
 
 
 
-PhraseMap pm;                   // Phrase Map (usually a sorted array of strings)
-RMQ st;                         // An instance of the RMQ Data Structure
 char *if_mmap_addr = NULL;      // Pointer to the mmapped area of the file
 off_t if_length = 0;            // The length of the input file
 volatile bool building = false; // TRUE if the structure is being built
@@ -61,30 +59,55 @@ const char *ac_file = NULL;     // Path to the input file
 int port = 6767;                // The port number on which to start the HTTP server
 const char *project_homepage_url = "https://github.com/duckduckgo/cpp-libface/";
 
+std::map<std::string, PhraseMap*> pm_map;  // Map of key -> PhraseMap
+std::map<std::string, RMQ*> st_map;        // Map of key -> RMQ data structure
+
 enum {
     // We are in a non-WS state
     ILP_BEFORE_NON_WS  = 0,
 
+    // We are parsing the tenant (integer)
+    ILP_TENANT         = 1,
+
+    // We are in the state after the tenant but before the TAB
+    // character separating the tenant & the weight
+    ILP_BEFORE_WTAB    = 2,
+
+    // We are in the state after the TAB character and potentially
+    // before the weight starts (or at the weight)
+    ILP_AFTER_WTAB     = 3,
+
     // We are parsing the weight (integer)
-    ILP_WEIGHT         = 1,
+    ILP_WEIGHT         = 4,
 
     // We are in the state after the weight but before the TAB
-    // character separating the weight & the phrase
-    ILP_BEFORE_PTAB    = 2,
+    // character separating the weight & the locale
+    ILP_BEFORE_LTAB    = 5,
+
+    // We are in the state after the TAB character and potentially
+    // before the locale starts (or at the locale)
+    ILP_AFTER_LTAB     = 6,
+
+    // The state parsing the locale
+    ILP_LOCALE         = 7,
+
+    // We are in the state after the locale but before the TAB
+    // character separating the locale & the phrase
+    ILP_BEFORE_PTAB    = 8,
 
     // We are in the state after the TAB character and potentially
     // before the phrase starts (or at the phrase)
-    ILP_AFTER_PTAB     = 3,
+    ILP_AFTER_PTAB     = 9,
 
     // The state parsing the phrase
-    ILP_PHRASE         = 4,
+    ILP_PHRASE         = 10,
 
     // The state after the TAB character following the phrase
     // (currently unused)
-    ILP_AFTER_STAB     = 5,
+    ILP_AFTER_STAB     = 11,
 
     // The state in which we are parsing the snippet
-    ILP_SNIPPET        = 6
+    ILP_SNIPPET        = 12
 };
 
 enum { IMPORT_FILE_NOT_FOUND = 1,
@@ -98,7 +121,9 @@ struct InputLineParser {
     const char *mem_base; // Base address of the mmapped file
     const char *buff;     // A pointer to the current line to be parsed
     size_t buff_offset;   // Offset of 'buff' [above] relative to the beginning of the file. Used to index into mem_base
+    int *pt;              // A pointer to the tentant field
     int *pn;              // A pointer to any integral field being parsed
+    std::string *plocale; // A pointer to the locale field
     std::string *pphrase; // A pointer to a string field being parsed
 
     // The input file is mmap()ped in the process' address space.
@@ -106,18 +131,22 @@ struct InputLineParser {
     StringProxy *psnippet_proxy; // The psnippet_proxy is a pointer to a Proxy String object that points to memory in the mmapped region
 
     InputLineParser(const char *_mem_base, size_t _bo, 
-                    const char *_buff, int *_pn, 
+                    const char *_buff, int *_pt,
+                    std::string *_plocale, int *_pn,
                     std::string *_pphrase, StringProxy *_psp)
         : state(ILP_BEFORE_NON_WS), mem_base(_mem_base), buff(_buff), 
-          buff_offset(_bo), pn(_pn), pphrase(_pphrase), psnippet_proxy(_psp)
+          buff_offset(_bo), pt(_pt), plocale(_plocale), pn(_pn),
+          pphrase(_pphrase), psnippet_proxy(_psp)
     { }
 
     void
     start_parsing() {
         int i = 0;                  // The current record byte-offset.
         int n = 0;                  // Temporary buffer for numeric (integer) fields.
+        const char *l_start = NULL; // Beginning of the locale.
         const char *p_start = NULL; // Beginning of the phrase.
         const char *s_start = NULL; // Beginning of the snippet.
+        int l_len = 0;              // Locale Length.
         int p_len = 0;              // Phrase Length.
         int s_len = 0;              // Snippet length.
 
@@ -128,11 +157,41 @@ struct InputLineParser {
             switch (this->state) {
             case ILP_BEFORE_NON_WS:
                 if (!isspace(ch)) {
-                    this->state = ILP_WEIGHT;
+                    this->state = ILP_TENANT;
                 }
                 else {
                     ++i;
                 }
+                break;
+
+            case ILP_TENANT:
+                if (isdigit(ch)) {
+                    n *= 10;
+                    n += (ch - '0');
+                    ++i;
+                }
+                else {
+                    on_tenant(n);
+                    this->state = ILP_BEFORE_WTAB;
+                    n = 0;
+                }
+                break;
+
+            case ILP_BEFORE_WTAB:
+                if (ch == '\t') {
+                    this->state = ILP_AFTER_WTAB;
+                }
+                ++i;
+                break;
+
+            case ILP_AFTER_WTAB:
+                if (isspace(ch)) {
+                    ++i;
+                }
+                else {
+                    this->state = ILP_WEIGHT;
+                }
+
                 break;
 
             case ILP_WEIGHT:
@@ -142,9 +201,40 @@ struct InputLineParser {
                     ++i;
                 }
                 else {
-                    this->state = ILP_BEFORE_PTAB;
+                    this->state = ILP_BEFORE_LTAB;
                     on_weight(n);
                 }
+                break;
+
+            case ILP_BEFORE_LTAB:
+                if (ch == '\t') {
+                    this->state = ILP_AFTER_LTAB;
+                }
+                ++i;
+                break;
+
+            case ILP_AFTER_LTAB:
+                if (isspace(ch)) {
+                    ++i;
+                }
+                else {
+                    l_start = this->buff + i;
+                    this->state = ILP_LOCALE;
+                }
+                break;
+
+            case ILP_LOCALE:
+                if (ch == '\t') {
+                    this->state = ILP_AFTER_PTAB;
+                }
+                else if (isspace(ch)) {
+                    // Locale should not contain spaces
+                    this->state = ILP_BEFORE_PTAB;
+                }
+                else {
+                    ++l_len;
+                }
+                ++i;
                 break;
 
             case ILP_BEFORE_PTAB:
@@ -187,9 +277,23 @@ struct InputLineParser {
 
             };
         }
+
         DCERR("\n");
+        on_locale(l_start, l_len);
         on_phrase(p_start, p_len);
         on_snippet(s_start, s_len);
+    }
+
+    void
+    on_tenant(int n) {
+        *(this->pt) = n;
+    }
+
+    void
+    on_locale(const char *data, int len) {
+        if (len && this->plocale) {
+            this->plocale->assign(data, len);
+        }
     }
 
     void
@@ -474,6 +578,13 @@ void get_line(std::ifstream fin, char *buff, int buff_len, int &read_len) {
     buff[INPUT_LINE_SIZE - 1] = '\0';
 }
 
+std::string get_key(std::string tenant, std::string locale) {
+    std:string key = tenant;
+    key += ':';
+    key.append(locale);
+
+    return key;
+}
 
 int
 do_import(std::string file, uint_t limit, 
@@ -521,9 +632,15 @@ do_import(std::string file, uint_t limit,
             return -IMPORT_MMAP_FAILED;
         }
 
-        pm.repr.clear();
+        
+        for (std::map<std::string, PhraseMap*>::iterator it = pm_map.begin(); it != pm_map.end(); ++it) {
+            it->second->repr.clear();
+        }
+
         char buff[INPUT_LINE_SIZE];
         std::string prev_phrase;
+        PhraseMap* current_map;
+        RMQ* current_rmq;
 
         while (!is_EOF(fin) && limit--) {
             buff[0] = '\0';
@@ -537,16 +654,31 @@ do_import(std::string file, uint_t limit,
             ++nlines;
 
             int weight = 0;
+            int tenant = 0;
+            std::string locale;
             std::string phrase;
             StringProxy snippet;
-            InputLineParser(if_mmap_addr, foffset, buff, &weight, &phrase, &snippet).start_parsing();
+            InputLineParser(if_mmap_addr, foffset, buff, &tenant, &locale, &weight, &phrase, &snippet).start_parsing();
 
             foffset += llen;
+
+            if (locale.empty()) {
+                continue;
+            }
+
+            std:string key = get_key(std::to_string(tenant), locale);
+
+            try {
+                current_map = pm_map.at(key);
+            } catch (const std::out_of_range& oor) {
+                current_map = new PhraseMap();
+                pm_map[key] = current_map;
+            }
 
             if (!phrase.empty()) {
                 str_lowercase(phrase);
                 DCERR("Adding: " << weight << ", " << phrase << ", " << std::string(snippet) << endl);
-                pm.insert(weight, phrase, snippet);
+                current_map->insert(weight, phrase, snippet);
             }
             if (is_input_sorted && prev_phrase <= phrase) {
                 prev_phrase.swap(phrase);
@@ -556,18 +688,32 @@ do_import(std::string file, uint_t limit,
         }
 
         DCERR("Creating PhraseMap::Input is " << (!is_input_sorted ? "NOT " : "") << "sorted\n");
-
         fclose(fin);
-        pm.finalize(is_input_sorted);
-        vui_t weights;
-        for (size_t i = 0; i < pm.repr.size(); ++i) {
-            weights.push_back(pm.repr[i].weight);
+
+        rnadded = 0;
+
+        for (std::map<std::string, PhraseMap*>::iterator it = pm_map.begin(); it != pm_map.end(); ++it) {
+            PhraseMap* pm = it->second;
+            pm->finalize();
+
+            vui_t weights;
+            for (size_t i = 0; i < pm->repr.size(); ++i) {
+                weights.push_back(pm->repr[i].weight);
+            }
+
+            try {
+                current_rmq = st_map.at(it->first);
+            } catch (const std::out_of_range& oor) {
+                current_rmq = new RMQ();
+                st_map[it->first] = current_rmq;
+            }
+
+            current_rmq->initialize(weights);
+
+            rnadded += (int) weights.size();
         }
-        st.initialize(weights);
 
-        rnadded = weights.size();
         rnlines = nlines;
-
         building = false;
     }
 
@@ -638,14 +784,21 @@ static void handle_export(client_t *client, parsed_url_t &url) {
     building = true;
     ofstream fout(file.c_str());
     const time_t start_time = time(NULL);
+    int nwritten = 0;
 
-    for (size_t i = 0; i < pm.repr.size(); ++i) {
-        fout<<pm.repr[i].weight<<'\t'<<pm.repr[i].phrase<<'\t'<<std::string(pm.repr[i].snippet)<<'\n';
+    for (std::map<std::string, PhraseMap*>::iterator it = pm_map.begin(); it != pm_map.end(); ++it) {
+        PhraseMap* pm = it->second;
+
+        for (size_t i = 0; i < pm->repr.size(); ++i) {
+            fout<<pm->repr[i].weight<<'\t'<<pm->repr[i].phrase<<'\t'<<std::string(pm->repr[i].snippet)<<'\n';
+        }
+
+        nwritten += (int) pm->repr.size();
     }
 
     building = false;
     std::ostringstream os;
-    os << "Successfully wrote " << pm.repr.size()
+    os << "Successfully wrote " << nwritten
        << " records to output file '" << file
        << "' in " << (time(NULL) - start_time) << "second(s)\n";
     body = os.str();
@@ -663,12 +816,14 @@ static void handle_suggest(client_t *client, parsed_url_t &url) {
         return;
     }
 
-    std::string q    = unescape_query(url.query["q"]);
-    std::string sn   = url.query["n"];
-    std::string cb   = unescape_query(url.query["callback"]);
-    std::string type = unescape_query(url.query["type"]);
+    std::string q      = unescape_query(url.query["q"]);
+    std::string sn     = url.query["n"];
+    std::string cb     = unescape_query(url.query["callback"]);
+    std::string type   = unescape_query(url.query["type"]);
+    std::string locale = unescape_query(url.query["l"]);
+    std::string tenant = unescape_query(url.query["t"]);
 
-    DCERR("handle_suggest::q:"<<q<<", sn:"<<sn<<", callback: "<<cb<<endl);
+    DCERR("handle_suggest::q:"<<q<<", sn:"<<sn<<", tenant:"<<tenant<<", locale:"<<locale<<", callback: "<<cb<<endl);
 
     unsigned int n = sn.empty() ? NMAX : atoi(sn.c_str());
     if (n > NMAX) {
@@ -680,7 +835,15 @@ static void handle_suggest(client_t *client, parsed_url_t &url) {
 
     const bool has_cb = !cb.empty();
     str_lowercase(q);
-    vp_t results = suggest(pm, st, q, n);
+    vp_t results = vp_t();
+
+    std:string key = get_key(tenant, locale);
+
+    try {
+        PhraseMap* map = new PhraseMap(pm_map.at(key));
+        RMQ* rmq = new RMQ(st_map.at(key));
+        results = suggest(*map, *rmq, q, n);
+    } catch (const std::out_of_range& oor) {}
 
     /*
       for (size_t i = 0; i < results.size(); ++i) {
@@ -712,7 +875,13 @@ static void handle_stats(client_t *client, parsed_url_t &url) {
         b += sprintf(b, "Data Store is busy\n");
     }
     else {
-        b += sprintf(b, "Data store size: %d entries\n", pm.repr.size());
+        int size = 0;
+
+        for (std::map<std::string, PhraseMap*>::iterator it = pm_map.begin(); it != pm_map.end(); ++it) {
+            size += (int) it->second->repr.size();
+        }
+
+        b += sprintf(b, "Data store size: %d entries\n", size);
     }
     b += sprintf(b, "Memory usage: %d MiB\n", get_memory_usage(getpid())/1024);
     body = buff;
