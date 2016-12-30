@@ -28,6 +28,20 @@ public:
         this->if_length = 0;
         this->building = false;
     }
+
+    size_t 
+    finalize() {
+        this->pm.finalize();
+
+        vui_t weights;
+        for (size_t i = 0; i < this->pm.repr.size(); ++i) {
+            weights.push_back(this->pm.repr[i].weight);
+        }
+
+        this->st.initialize(weights);
+
+        return weights.size();
+    }
 };
 
 #endif // LIBFACE_DATA_CONTAINER_HPP

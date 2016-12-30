@@ -493,43 +493,43 @@ do_import(std::string file, const std::string key, uint_t limit,
     else {
         int nlines = 0;
         int foffset = 0;
-        DataContainer* data_container;
+        DataContainer* container;
 
         try {
-            data_container = data_map.at(key);
-            data_container->building = true;
+            container = data_map.at(key);
+            container->building = true;
 
-            int r = munmap(data_container->if_mmap_addr, data_container->if_length);
+            int r = munmap(container->if_mmap_addr, container->if_length);
             
             if (r < 0) {
                 perror("munmap");
-                data_container->building = false;
+                container->building = false;
                 return -IMPORT_MUNMAP_FAILED;
             }
         } catch (const std::out_of_range& oor) {
-            data_container = new DataContainer;
-            data_container->building = true;
-            data_map[key] = data_container;
+            container = new DataContainer;
+            container->building = true;
+            data_map[key] = container;
         }
 
         // Potential race condition + not checking for return value
-        data_container->if_length = file_size(file.c_str());
+        container->if_length = file_size(file.c_str());
 
         // mmap() the input file in
-        data_container->if_mmap_addr = (char*) mmap(
-            NULL, size_t(data_container->if_length), PROT_READ, MAP_SHARED, fd, 0
+        container->if_mmap_addr = (char*) mmap(
+            NULL, size_t(container->if_length), PROT_READ, MAP_SHARED, fd, 0
         );
     
-        if (data_container->if_mmap_addr == MAP_FAILED) {
-            fprintf(stderr, "length: %llu, fd: %d\n", data_container->if_length, fd);
+        if (container->if_mmap_addr == MAP_FAILED) {
+            fprintf(stderr, "length: %llu, fd: %d\n", container->if_length, fd);
             perror("mmap");
             if (fin) { fclose(fin); }
             if (fd != -1) { close(fd); }
-            data_container->building = false;
+            container->building = false;
             return -IMPORT_MMAP_FAILED;
         }
 
-        data_container->pm.repr.clear();
+        container->pm.repr.clear();
 
         char buff[INPUT_LINE_SIZE];
         std::string prev_phrase;
@@ -549,13 +549,13 @@ do_import(std::string file, const std::string key, uint_t limit,
             std::string phrase;
             StringProxy snippet;
 
-            InputLineParser(data_container, foffset, buff, &weight, &phrase, &snippet).start_parsing();
+            InputLineParser(container, foffset, buff, &weight, &phrase, &snippet).start_parsing();
             foffset += llen;
 
             if (!phrase.empty()) {
                 str_lowercase(phrase);
                 DCERR("Adding: " << weight << ", " << phrase << ", " << std::string(snippet) << endl);
-                data_container->pm.insert(weight, phrase, snippet);
+                container->pm.insert(weight, phrase, snippet);
             }
             if (is_input_sorted && prev_phrase <= phrase) {
                 prev_phrase.swap(phrase);
@@ -567,18 +567,9 @@ do_import(std::string file, const std::string key, uint_t limit,
         DCERR("Creating PhraseMap::Input is " << (!is_input_sorted ? "NOT " : "") << "sorted\n");
         fclose(fin);
 
-        data_container->pm.finalize();
-
-        vui_t weights;
-        for (size_t i = 0; i < data_container->pm.repr.size(); ++i) {
-            weights.push_back(data_container->pm.repr[i].weight);
-        }
-
-        data_container->st.initialize(weights);
-
-        rnadded = weights.size();
+        rnadded = container->finalize();
         rnlines = nlines;
-        data_container->building = false;
+        container->building = false;
     }
 
     return 0;
@@ -641,33 +632,33 @@ static void handle_export(client_t *client, parsed_url_t &url) {
 
     std::string file = url.query["file"];
     std::string key = unescape_query(url.query["key"]);
-    DataContainer* data_container;
+    DataContainer* container;
 
     try {
-        data_container = data_map.at(key);
+        container = data_map.at(key);
     } catch (const std::out_of_range& oor) {
         body = "Key not found";
         write_response(client, 404, "Not found", headers, body);
     }
 
-    if (data_container->building) {
+    if (container->building) {
         body = "Busy\n";
         write_response(client, 412, "Busy", headers, body);
         return;
     }
 
     // Prevent modifications to 'pm' while we export
-    data_container->building = true;
+    container->building = true;
     ofstream fout(file.c_str());
     const time_t start_time = time(NULL);
 
-    for (size_t i = 0; i < data_container->pm.repr.size(); ++i) {
-        fout<<data_container->pm.repr[i].weight<<'\t'<<data_container->pm.repr[i].phrase<<'\t'<<std::string(data_container->pm.repr[i].snippet)<<'\n';
+    for (size_t i = 0; i < container->pm.repr.size(); ++i) {
+        fout<<container->pm.repr[i].weight<<'\t'<<container->pm.repr[i].phrase<<'\t'<<std::string(container->pm.repr[i].snippet)<<'\n';
     }
 
-    data_container->building = false;
+    container->building = false;
     std::ostringstream os;
-    os << "Successfully wrote " << data_container->pm.repr.size()
+    os << "Successfully wrote " << container->pm.repr.size()
     << " records to output file '" << file
     << "' in " << (time(NULL) - start_time) << "second(s)\n";
     body = os.str();
@@ -680,11 +671,11 @@ static void handle_suggest(client_t *client, parsed_url_t &url) {
     headers_t headers;
     headers["Cache-Control"] = "no-cache";
 
-    DataContainer* data_container;
+    DataContainer* container;
     std::string key = unescape_query(url.query["k"]);
 
     try {
-        data_container = data_map.at(key);
+        container = data_map.at(key);
     } catch (const std::out_of_range& oor) {
         body = "Key not found";
         write_response(client, 404, "Not found", headers, body);
@@ -692,7 +683,7 @@ static void handle_suggest(client_t *client, parsed_url_t &url) {
     }
 
 
-    if (data_container->building) {
+    if (container->building) {
         write_response(client, 412, "Busy", headers, body);
         return;
     }
@@ -714,7 +705,7 @@ static void handle_suggest(client_t *client, parsed_url_t &url) {
 
     const bool has_cb = !cb.empty();
     str_lowercase(q);
-    vp_t results = suggest(data_container->pm, data_container->st, q, n);
+    vp_t results = suggest(container->pm, container->st, q, n);
 
     /*
       for (size_t i = 0; i < results.size(); ++i) {
@@ -744,6 +735,7 @@ static void handle_stats(client_t *client, parsed_url_t &url) {
 
     int size = 0;
     int building = 0;
+    off_t data_length = 0;
 
     for (std::map<std::string, DataContainer*>::iterator it = data_map.begin(); it != data_map.end(); ++it) {
         if (it->second->building) {
@@ -752,9 +744,10 @@ static void handle_stats(client_t *client, parsed_url_t &url) {
         }
 
         size += (int) it->second->pm.repr.size();
+        data_length += sizeof(char*) * it->second->if_length;
     }
 
-    b += sprintf(b, "Data store size: %d keys, %d total entries\n", data_map.size(), size);
+    b += sprintf(b, "Data store size: %d keys, %d total entries, %d MiB\n", data_map.size(), size, data_length/1048576);
     b += sprintf(b, "Memory usage: %d MiB\n", get_memory_usage(getpid())/1024);
     b += sprintf(b, "Building: %d containers\n", building);
 
